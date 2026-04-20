@@ -2993,11 +2993,15 @@ function renderSchedule(){
       const dayBreaks     = sh.breaks.map(b=>({s:b.s+dayBase, e:b.e+dayBase, n:b.n}));
 
       // ── Header (same for empty and full) ──
+      const machIcon = getMachineIcon(m.name);
       const hdr = `
         <div style="display:flex;justify-content:space-between;align-items:flex-start;padding:10px 16px 8px;border-bottom:3px solid ${m.color};background:${m.color}18">
-          <div>
+          <div style="display:flex;align-items:center;gap:14px">
+            ${machIcon ? `<div style="width:56px;height:56px;color:${m.color};flex-shrink:0;opacity:.9">${machIcon}</div>` : ''}
+            <div>
             <div style="font-family:'Playfair Display',serif;font-size:22px;font-weight:900;letter-spacing:3px;color:${m.color}">${m.name.toUpperCase()}</div>
             ${m.area?`<div style="font-size:9px;color:var(--dim);font-family:'DM Mono',monospace;letter-spacing:1px;text-transform:uppercase">${m.area}</div>`:''}
+            </div>
             <div style="font-size:10px;color:var(--dim);font-family:'DM Mono',monospace;margin-top:3px">
               ${slots.length} job${slots.length!==1?'s':''} &nbsp;·&nbsp; ${Math.round(totalTodayMin)}min / ${eff}min effective
               ${overflowOut.length?` &nbsp;·&nbsp; <span style="color:var(--warning);font-weight:700">${overflowOut.length} &#x2192; ${nextDayName}</span>`:''}
@@ -4190,80 +4194,163 @@ function runSearch(q){
         const p = getProd(o.productId);
         return (o.num||'').toLowerCase().includes(term)
           || (p?.name||'').toLowerCase().includes(term)
-          || (o.customerName||'').toLowerCase().includes(term);
+          || (o.customerName||'').toLowerCase().includes(term)
+          || (o.notes||'').toLowerCase().includes(term);
       })
-    : all.slice().sort((a,b)=>a.pri-b.pri).slice(0,30);
+    : all.slice().sort((a,b)=>a.pri-b.pri).slice(0,20);
 
   if(!matches.length){
     el.innerHTML = '<div class="empty" style="padding:24px">No orders found</div>';
     return;
   }
 
-  const dayLabels = ['Mon','Tue','Wed','Thu','Fri'];
+  // Build schedule lookup
+  let schedLookup = {};
+  try {
+    const {machineTimelines} = buildAllSchedules();
+    Object.values(machineTimelines).forEach(tl=>{
+      tl.forEach(slot=>{
+        schedLookup[`${slot.orderId}__${slot.partId}__${slot.stepIdx||0}`] = slot;
+      });
+    });
+  } catch(e){ console.warn('Schedule lookup failed:', e); }
 
-  el.innerHTML = matches.map(o=>{
+  const dayNames = ['Mon','Tue','Wed','Thu','Fri'];
+
+  function absToDateTime(absMin, orderWk){
+    if(!absMin) return null;
+    const dayOffset = Math.floor(absMin / (24*60));
+    const localMin = absMin - dayOffset*24*60;
+    const hh = String(Math.floor(localMin/60)).padStart(2,'0');
+    const mm = String(localMin%60).padStart(2,'0');
+    const dow = dayOffset % 5;
+    const weekOffset = Math.floor(dayOffset / 5);
+    const wk = (orderWk||getISOWeek(new Date())) + weekOffset;
+    return {time:`${hh}:${mm}`, day:dayNames[dow], wk};
+  }
+
+  el.innerHTML = matches.map((o,oi)=>{
     const p = getProd(o.productId);
-    const steps = oSteps(o);
-    const pct = steps.length ? Math.round(o.stepIdx/steps.length*100) : 100;
+    const allSteps = oSteps(o);
+    const pct = allSteps.length ? Math.round(o.stepIdx/allSteps.length*100) : 100;
     const done = isDone(o);
-    const cur = steps[o.stepIdx];
     const shipWk = o.dispatchWeek || (o.rush?(o.week||0)+1:(o.week||0)+2);
     const shipDay = o.dispatchDay || o.day || 1;
-
-    // Progress colour
     const pc = done ? 'var(--green)' : pct>0 ? 'var(--accent)' : 'var(--dim)';
+    const expandId = `sr-expand-${oi}`;
 
-    // Current step label
-    let stepLabel = '';
-    if(done){
-      stepLabel = '<span style="color:var(--green);font-weight:700">&#x2713; Complete</span>';
-    } else if(cur){
-      stepLabel = `<span style="color:var(--text2)">${cur.partName}</span> <span style="color:var(--dim)">&#x2192;</span> ${mChip(cur.machineId)}`;
-    } else {
-      stepLabel = '<span style="color:var(--dim)">Not started</span>';
+    // Build parts detail (hidden until expanded)
+    let partsHTML = '';
+    if(p && p.parts){
+      p.parts.forEach(pt=>{
+        const realSteps = pt.steps.filter(s=>s.durSec>0);
+        if(!realSteps.length) return;
+        const doneSI = realSteps.filter((_,si)=>(o.partStatus||{})[`${pt.id}_${si}`]==='✓').length;
+        const partPct = Math.round(doneSI/realSteps.length*100);
+        const partDone = doneSI === realSteps.length;
+        const partColor = partDone ? 'var(--green)' : doneSI>0 ? 'var(--accent)' : 'var(--dim)';
+        const isAsm = pt.isAssembly||/assembly/i.test(pt.name||'');
+
+        let stepRows = realSteps.map((s,si)=>{
+          const stepDone = (o.partStatus||{})[`${pt.id}_${si}`]==='✓';
+          const slot = schedLookup[`${o.id}__${pt.id}__${si}`];
+          const dt = slot ? absToDateTime(slot.startAbs, o.week) : null;
+
+          const schedLabel = stepDone
+            ? `<span style="color:var(--green);font-weight:700;font-size:10px">&#x2713; Done</span>`
+            : dt
+              ? `<span style="font-family:'DM Mono',monospace;font-size:10px;color:var(--accent2);font-weight:700">Wk${dt.wk} ${dt.day} &nbsp; ${dt.time}</span>`
+              : `<span style="font-size:10px;color:var(--dim)">not scheduled</span>`;
+
+          return `<div style="display:flex;align-items:center;gap:10px;padding:5px 12px;border-bottom:1px solid rgba(46,42,36,.4);${stepDone?'opacity:.6':''}">
+            <div style="width:8px;height:8px;border-radius:50%;flex-shrink:0;background:${stepDone?'var(--green)':'var(--border2)'}"></div>
+            <div style="flex:1;min-width:0">${mChip(s.machineId)}</div>
+            <div style="font-family:'DM Mono',monospace;font-size:9px;color:var(--dim);flex-shrink:0">${s.durSec}s/pt</div>
+            <div style="flex-shrink:0;text-align:right">${schedLabel}</div>
+          </div>`;
+        }).join('');
+
+        partsHTML += `<div style="border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:8px">
+          <div style="display:flex;align-items:center;gap:8px;padding:7px 12px;background:var(--panel2)">
+            <span style="font-size:12px;font-weight:700;color:var(--bright);flex:1">${pt.name}</span>
+            <span style="font-family:'DM Mono',monospace;font-size:9px;color:var(--dim)">${pt.qtyPer}/unit · ${pt.qtyPer*o.qty} total</span>
+            ${isAsm?'<span style="background:var(--blue);color:#fff;padding:1px 6px;border-radius:3px;font-size:8px;font-weight:700">ASM</span>':''}
+            <span style="font-family:'DM Mono',monospace;font-size:10px;font-weight:700;color:${partColor}">${partPct}%</span>
+          </div>
+          ${stepRows}
+        </div>`;
+      });
     }
 
-    return `<div class="srch-result" onclick="closeMo('searchMo');openEdit('${o.id}')">
+    return `<div style="border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;margin-bottom:8px;background:var(--panel2)">
 
-      <!-- Top row: order num · product · rush badge -->
-      <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:8px;flex-wrap:wrap">
-        <span style="font-family:'DM Mono',monospace;font-size:12px;font-weight:700;color:var(--accent)">${o.num||'—'}</span>
-        ${o.rush?'<span class="rush-badge">Rush</span>':''}
-        <span style="font-size:14px;font-weight:700;color:var(--bright);font-family:\'DM Sans\',sans-serif">${p?.name||'?'}</span>
-        ${o.customerName?`<span style="font-size:10px;color:var(--dim)">· ${o.customerName}</span>`:''}
-        <span style="margin-left:auto;font-family:'DM Mono',monospace;font-size:10px;color:var(--dim)">× ${o.qty}</span>
+      <!-- Collapsed header — always visible, click to expand -->
+      <div onclick="document.getElementById('${expandId}').style.display=document.getElementById('${expandId}').style.display==='none'?'block':'none';this.querySelector('.sr-arrow').style.transform=document.getElementById('${expandId}').style.display==='none'?'rotate(0deg)':'rotate(90deg)'"
+        style="display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;user-select:none">
+        <svg class="sr-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="color:var(--text);flex-shrink:0;transition:transform .2s"><polyline points="9 18 15 12 9 6"/></svg>
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span style="font-family:'DM Mono',monospace;font-size:11px;font-weight:700;color:var(--accent)">${o.num||'—'}</span>
+            ${o.rush?'<span class="rush-badge">Rush</span>':''}
+            <span style="font-size:14px;font-weight:700;color:var(--bright)">${p?.name||'?'}</span>
+            ${o.customerName?`<span style="font-size:10px;color:var(--dim)">· ${o.customerName}</span>`:''}
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;margin-top:4px;flex-wrap:wrap">
+            <span style="font-family:'DM Mono',monospace;font-size:10px;color:var(--text)">Wk${o.week||'?'}/${dayNames[(o.day||1)-1]} &#x2192; Dispatch Wk${shipWk}/${dayNames[shipDay-1]}</span>
+            <span style="font-family:'DM Mono',monospace;font-size:10px;color:var(--dim)">×${o.qty}</span>
+          </div>
+        </div>
+        <!-- Mini progress bar -->
+        <div style="width:80px;flex-shrink:0">
+          <div style="background:var(--border);border-radius:3px;height:4px;overflow:hidden;margin-bottom:2px">
+            <div style="background:${pc};height:100%;width:${pct}%;border-radius:3px"></div>
+          </div>
+          <div style="font-family:'DM Mono',monospace;font-size:9px;color:${pc};text-align:right">${pct}% ${done?'&#x2713;':''}</div>
+        </div>
       </div>
 
-      <!-- Schedule row -->
-      <div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap">
-        <div>
-          <div style="font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1px;text-transform:uppercase;color:var(--dim);margin-bottom:2px">Production</div>
-          <div style="font-family:'DM Mono',monospace;font-size:12px;font-weight:700;color:var(--text2)">Wk ${o.week||'?'} / ${dayLabels[(o.day||1)-1]}</div>
-        </div>
-        <div>
-          <div style="font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1px;text-transform:uppercase;color:var(--dim);margin-bottom:2px">Dispatch</div>
-          <div style="font-family:'DM Mono',monospace;font-size:12px;font-weight:700;color:var(--blue)">Wk ${shipWk} / ${dayLabels[shipDay-1]}</div>
-        </div>
-      </div>
+      <!-- Expanded detail — hidden by default -->
+      <div id="${expandId}" style="display:none;border-top:1px solid var(--border)">
+        <div style="padding:12px 14px">
 
-      <!-- Progress bar -->
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-        <div style="flex:1;background:var(--border);border-radius:3px;height:5px;overflow:hidden">
-          <div style="background:${pc};height:100%;width:${pct}%;border-radius:3px;transition:width .3s"></div>
-        </div>
-        <span style="font-family:'DM Mono',monospace;font-size:10px;font-weight:700;color:${pc};flex-shrink:0">${pct}%</span>
-      </div>
+          <!-- Info grid -->
+          <div style="display:grid;grid-template-columns:1fr 1fr ${o.notes?'1fr':'0fr'};gap:8px;margin-bottom:14px">
+            <div style="background:var(--panel3);border-radius:6px;padding:8px 10px">
+              <div style="font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1px;text-transform:uppercase;color:var(--dim);margin-bottom:3px">Production Start</div>
+              <div style="font-family:'DM Mono',monospace;font-size:12px;font-weight:700;color:var(--text2)">Week ${o.week||'?'} / ${dayNames[(o.day||1)-1]}</div>
+            </div>
+            <div style="background:var(--panel3);border-radius:6px;padding:8px 10px">
+              <div style="font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1px;text-transform:uppercase;color:var(--dim);margin-bottom:3px">Dispatch</div>
+              <div style="font-family:'DM Mono',monospace;font-size:12px;font-weight:700;color:var(--blue)">Week ${shipWk} / ${dayNames[shipDay-1]}</div>
+            </div>
+            ${o.notes?`<div style="background:var(--panel3);border-radius:6px;padding:8px 10px">
+              <div style="font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1px;text-transform:uppercase;color:var(--dim);margin-bottom:3px">Notes</div>
+              <div style="font-size:10px;color:var(--text)">${o.notes}</div>
+            </div>`:''}
+          </div>
 
-      <!-- Current step -->
-      <div style="font-size:11px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-        <span style="font-family:'DM Mono',monospace;font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1px">Now at:</span>
-        ${stepLabel}
+          <!-- Parts heading -->
+          <div style="font-family:'DM Mono',monospace;font-size:8px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);margin-bottom:8px">Parts &amp; Scheduled Machine Times</div>
+
+          ${partsHTML||'<div style="font-size:10px;color:var(--dim);font-style:italic">No parts defined for this product</div>'}
+
+          <!-- Actions -->
+          <div style="display:flex;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+            <button class="btn bs bsm" onclick="closeMo('searchMo');openEdit('${o.id}')">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+              Edit Order
+            </button>
+            <button class="btn bs bsm" onclick="closeMo('searchMo');T('tracking')">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+              Part Tracking
+            </button>
+          </div>
+        </div>
       </div>
 
     </div>`;
   }).join('');
 }
-
 // Keyboard shortcut: Ctrl+K or Ctrl+F to open search
 document.addEventListener('keydown', function(e){
   if((e.ctrlKey||e.metaKey) && (e.key==='k'||e.key==='f')){
@@ -4297,6 +4384,39 @@ function toggleNewOrder(){
   }
 }
 
+
+// ════════════ MACHINE ICONS ════════════
+function getMachineIcon(machineName){
+  const n = (machineName||"").toLowerCase();
+  const icons = {
+    "Cutt off": `<svg viewBox="0 0 90 90" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="45" cy="52" r="28" stroke="#7c3b1e" stroke-width="4" fill="#f5ece6"/><circle cx="45" cy="52" r="10" stroke="#7c3b1e" stroke-width="3.5" fill="#e8d0c0"/><line x1="45" y1="24" x2="42" y2="14" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="45" y1="24" x2="48" y2="14" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="63" y1="31" x2="71" y2="24" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="65" y1="33" x2="75" y2="32" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="73" y1="52" x2="83" y2="49" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="73" y1="52" x2="83" y2="55" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="63" y1="73" x2="71" y2="80" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="65" y1="71" x2="75" y2="72" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="45" y1="80" x2="42" y2="88" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="45" y1="80" x2="48" y2="88" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="27" y1="73" x2="19" y2="80" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="25" y1="71" x2="15" y2="72" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="17" y1="52" x2="7" y2="49" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="17" y1="52" x2="7" y2="55" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="27" y1="31" x2="19" y2="24" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><line x1="25" y1="33" x2="15" y2="32" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><rect x="34" y="4" width="22" height="12" rx="5" stroke="#7c3b1e" stroke-width="3.5" fill="#e8d0c0"/></svg>`,
+    "Tube Laser": `<svg viewBox="0 0 90 90" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="38" width="82" height="16" rx="8" stroke="#7c3b1e" stroke-width="4" fill="#f5ece6"/><rect x="26" y="8" width="38" height="26" rx="7" stroke="#7c3b1e" stroke-width="4" fill="#e8d0c0"/><circle cx="45" cy="21" r="5" stroke="#7c3b1e" stroke-width="3" fill="#f5ece6"/><line x1="45" y1="34" x2="45" y2="38" stroke="#7c3b1e" stroke-width="3.5"/><line x1="45" y1="38" x2="38" y2="46" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><line x1="45" y1="38" x2="52" y2="46" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><line x1="45" y1="38" x2="41" y2="49" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><line x1="45" y1="38" x2="49" y2="49" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><circle cx="38" cy="48" r="2.5" fill="#7c3b1e"/><circle cx="52" cy="48" r="2" fill="#7c3b1e"/><rect x="6" y="60" width="26" height="12" rx="5" stroke="#7c3b1e" stroke-width="3" fill="#e8d0c0"/><rect x="58" y="60" width="26" height="12" rx="5" stroke="#7c3b1e" stroke-width="3" fill="#e8d0c0"/></svg>`,
+    "Swage": `<svg viewBox="0 0 90 90" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="16" y="4" width="58" height="13" rx="5" stroke="#7c3b1e" stroke-width="4" fill="#e8d0c0"/><line x1="22" y1="17" x2="22" y2="35" stroke="#7c3b1e" stroke-width="4" stroke-linecap="round"/><line x1="68" y1="17" x2="68" y2="35" stroke="#7c3b1e" stroke-width="4" stroke-linecap="round"/><path d="M20 35 Q24 35 45 54 Q66 35 70 35" stroke="#7c3b1e" stroke-width="4" fill="#f5ece6" stroke-linejoin="round"/><path d="M20 70 Q24 70 45 54 Q66 70 70 70" stroke="#7c3b1e" stroke-width="4" fill="#f5ece6" stroke-linejoin="round"/><circle cx="45" cy="54" r="5" stroke="#7c3b1e" stroke-width="2.5" fill="#e8d0c0"/><rect x="16" y="70" width="58" height="13" rx="5" stroke="#7c3b1e" stroke-width="4" fill="#e8d0c0"/><line x1="45" y1="4" x2="45" y2="35" stroke="#7c3b1e" stroke-width="2.5" stroke-dasharray="4 3"/></svg>`,
+    "E40": `<svg viewBox="0 0 90 90" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="6" y="20" width="34" height="50" rx="7" stroke="#7c3b1e" stroke-width="4" fill="#e8d0c0"/><circle cx="23" cy="45" r="14" stroke="#7c3b1e" stroke-width="3.5" fill="#f5ece6"/><circle cx="23" cy="45" r="4" stroke="#7c3b1e" stroke-width="2" fill="#e8d0c0"/><line x1="40" y1="45" x2="84" y2="45" stroke="#7c3b1e" stroke-width="7" stroke-linecap="round"/><ellipse cx="42" cy="45" rx="5" ry="10" stroke="#7c3b1e" stroke-width="3.5" fill="#e8d0c0"/><line x1="23" y1="10" x2="23" y2="20" stroke="#7c3b1e" stroke-width="4.5" stroke-linecap="round"/><ellipse cx="23" cy="8" rx="9" ry="4" stroke="#7c3b1e" stroke-width="3" fill="#e8d0c0"/><line x1="58" y1="30" x2="68" y2="30" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><line x1="58" y1="36" x2="74" y2="36" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><line x1="58" y1="42" x2="68" y2="42" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/></svg>`,
+    "E32": `<svg viewBox="0 0 90 90" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="6" y="20" width="34" height="50" rx="7" stroke="#7c3b1e" stroke-width="4" fill="#e8d0c0"/><circle cx="23" cy="45" r="14" stroke="#7c3b1e" stroke-width="3.5" fill="#f5ece6"/><circle cx="23" cy="45" r="4" stroke="#7c3b1e" stroke-width="2" fill="#e8d0c0"/><line x1="40" y1="45" x2="84" y2="45" stroke="#7c3b1e" stroke-width="5" stroke-linecap="round"/><ellipse cx="42" cy="45" rx="4" ry="8" stroke="#7c3b1e" stroke-width="3.5" fill="#e8d0c0"/><line x1="23" y1="10" x2="23" y2="20" stroke="#7c3b1e" stroke-width="4.5" stroke-linecap="round"/><ellipse cx="23" cy="8" rx="9" ry="4" stroke="#7c3b1e" stroke-width="3" fill="#e8d0c0"/><line x1="58" y1="30" x2="68" y2="30" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><line x1="58" y1="36" x2="72" y2="36" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><line x1="58" y1="42" x2="65" y2="42" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/></svg>`,
+    "End Closing": `<svg viewBox="0 0 90 90" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="6" y="32" width="50" height="18" stroke="#7c3b1e" stroke-width="4" fill="#f5ece6"/><path d="M6 32 Q0 41 6 50" stroke="#7c3b1e" stroke-width="4" fill="#e8d0c0" stroke-linecap="round"/><line x1="56" y1="30" x2="56" y2="52" stroke="#7c3b1e" stroke-width="4" stroke-linecap="round"/><rect x="60" y="26" width="24" height="30" rx="5" stroke="#7c3b1e" stroke-width="4" fill="#e8d0c0"/><path d="M60 38 L56 41 L60 44" stroke="#7c3b1e" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/><polyline points="74,35 80,41 74,47" stroke="#7c3b1e" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/><rect x="4" y="54" width="54" height="9" rx="4" stroke="#7c3b1e" stroke-width="3" fill="#e8d0c0"/></svg>`,
+    "Weld": `<svg viewBox="0 0 90 90" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M18 44 Q14 26 45 20 Q76 26 72 44 L70 66 Q70 76 45 76 Q20 76 20 66 Z" stroke="#7c3b1e" stroke-width="4" fill="#f5ece6" stroke-linejoin="round"/><rect x="28" y="42" width="34" height="18" rx="5" stroke="#7c3b1e" stroke-width="3.5" fill="#e8d0c0"/><line x1="28" y1="36" x2="62" y2="36" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><path d="M28 36 Q20 30 22 20" stroke="#7c3b1e" stroke-width="2.5" fill="none"/><path d="M62 36 Q70 30 68 20" stroke="#7c3b1e" stroke-width="2.5" fill="none"/><line x1="70" y1="62" x2="80" y2="54" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><line x1="72" y1="69" x2="84" y2="68" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><line x1="68" y1="75" x2="76" y2="84" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><circle cx="81" cy="53" r="3" fill="#7c3b1e"/><circle cx="85" cy="67" r="2.5" fill="#7c3b1e"/><circle cx="77" cy="85" r="3" fill="#7c3b1e"/><line x1="68" y1="72" x2="85" y2="88" stroke="#7c3b1e" stroke-width="4.5" stroke-linecap="round"/></svg>`,
+    "Weld (Robot)": `<svg viewBox="0 0 90 90" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="28" y="68" width="34" height="12" rx="4" stroke="#7c3b1e" stroke-width="3.5" fill="#e8d0c0"/><rect x="36" y="52" width="18" height="18" rx="4" stroke="#7c3b1e" stroke-width="3.5" fill="#f5ece6"/><circle cx="45" cy="52" r="6" stroke="#7c3b1e" stroke-width="3" fill="#e8d0c0"/><path d="M45 52 L28 36 L18 36" stroke="#7c3b1e" stroke-width="4" stroke-linecap="round"/><rect x="8" y="28" width="16" height="16" rx="3" stroke="#7c3b1e" stroke-width="3" fill="#e8d0c0"/><path d="M45 52 L64 36 L74 36" stroke="#7c3b1e" stroke-width="4" stroke-linecap="round"/><rect x="66" y="28" width="16" height="16" rx="3" stroke="#7c3b1e" stroke-width="3" fill="#e8d0c0"/><line x1="82" y1="36" x2="88" y2="50" stroke="#7c3b1e" stroke-width="4" stroke-linecap="round"/><line x1="85" y1="56" x2="79" y2="60" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><line x1="87" y1="62" x2="81" y2="66" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round"/><circle cx="78" cy="62" r="3" fill="#7c3b1e"/><circle cx="80" cy="68" r="2.5" fill="#7c3b1e"/></svg>`,
+    "Grind": `<svg viewBox="0 0 90 90" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="6" y="22" width="44" height="24" rx="8" stroke="#7c3b1e" stroke-width="4" fill="#e8d0c0"/><rect x="2" y="30" width="10" height="10" rx="5" stroke="#7c3b1e" stroke-width="3" fill="#f5ece6"/><circle cx="62" cy="56" r="22" stroke="#7c3b1e" stroke-width="4" fill="#f5ece6"/><circle cx="62" cy="56" r="6" stroke="#7c3b1e" stroke-width="3" fill="#e8d0c0"/><path d="M40 38 Q38 56 40 68 L54 68" stroke="#7c3b1e" stroke-width="3.5" fill="none" stroke-linecap="round"/><line x1="72" y1="68" x2="80" y2="78" stroke="#7c3b1e" stroke-width="3" stroke-linecap="round"/><line x1="78" y1="62" x2="87" y2="68" stroke="#7c3b1e" stroke-width="3" stroke-linecap="round"/><line x1="68" y1="74" x2="74" y2="84" stroke="#7c3b1e" stroke-width="3" stroke-linecap="round"/><circle cx="81" cy="79" r="3" fill="#7c3b1e"/><circle cx="88" cy="67" r="2.5" fill="#7c3b1e"/><circle cx="75" cy="85" r="3" fill="#7c3b1e"/></svg>`,
+    "Paint": `<svg viewBox="0 0 90 90" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M10 24 L10 54 L30 54 L30 62 L42 62 L42 50 L58 50 L58 30 L42 30 L42 24 Z" stroke="#7c3b1e" stroke-width="4" fill="#e8d0c0" stroke-linejoin="round"/><path d="M18 54 L14 70 L30 70 L30 54" stroke="#7c3b1e" stroke-width="3.5" fill="#f5ece6" stroke-linejoin="round"/><rect x="58" y="33" width="10" height="8" rx="3" stroke="#7c3b1e" stroke-width="3" fill="#f5ece6"/><ellipse cx="18" cy="24" rx="10" ry="6" stroke="#7c3b1e" stroke-width="3.5" fill="#f5ece6"/><line x1="68" y1="34" x2="78" y2="27" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="3 2"/><line x1="68" y1="37" x2="80" y2="37" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="3 2"/><line x1="68" y1="40" x2="78" y2="47" stroke="#7c3b1e" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="3 2"/><circle cx="80" cy="26" r="3.5" stroke="#7c3b1e" stroke-width="2.5" fill="#f5ece6"/><circle cx="82" cy="37" r="3" stroke="#7c3b1e" stroke-width="2.5" fill="#f5ece6"/><circle cx="80" cy="48" r="3.5" stroke="#7c3b1e" stroke-width="2.5" fill="#f5ece6"/></svg>`,
+    "Boor": `<svg viewBox="0 0 90 90" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="22" y="72" width="40" height="12" rx="4" stroke="#7c3b1e" stroke-width="4" fill="#e8d0c0"/><line x1="42" y1="8" x2="42" y2="72" stroke="#7c3b1e" stroke-width="4.5" stroke-linecap="round"/><rect x="22" y="8" width="40" height="24" rx="6" stroke="#7c3b1e" stroke-width="4" fill="#e8d0c0"/><rect x="34" y="32" width="16" height="14" rx="3" stroke="#7c3b1e" stroke-width="3.5" fill="#f5ece6"/><line x1="42" y1="46" x2="42" y2="64" stroke="#7c3b1e" stroke-width="3.5" stroke-linecap="round"/><path d="M36 62 L42 74 L48 62" stroke="#7c3b1e" stroke-width="3.5" fill="#e8d0c0" stroke-linejoin="round"/><circle cx="70" cy="24" r="10" stroke="#7c3b1e" stroke-width="3" fill="#f5ece6"/><line x1="64" y1="24" x2="64" y2="14" stroke="#7c3b1e" stroke-width="3" stroke-linecap="round"/><line x1="70" y1="14" x2="70" y2="6" stroke="#7c3b1e" stroke-width="3" stroke-linecap="round"/><line x1="76" y1="24" x2="76" y2="14" stroke="#7c3b1e" stroke-width="3" stroke-linecap="round"/></svg>`
+  };
+  let key = null;
+  if(n.includes("cutt"))         key = "Cutt off";
+  else if(n.includes("laser"))   key = "Tube Laser";
+  else if(n.includes("swage"))   key = "Swage";
+  else if(n.includes("e40"))     key = "E40";
+  else if(n.includes("e32"))     key = "E32";
+  else if(n.includes("closing")) key = "End Closing";
+  else if(n.includes("robot"))   key = "Weld (Robot)";
+  else if(n.includes("weld"))    key = "Weld";
+  else if(n.includes("grind"))   key = "Grind";
+  else if(n.includes("paint"))   key = "Paint";
+  else if(n.includes("boor"))    key = "Boor";
+  return icons[key] || "";
+}
+
+
 // ════════════ BOOT ════════════
 window.onerror = function(msg, src, line){ 
   console.error('SteelFlow error:', msg, 'line:', line); 
@@ -4320,7 +4440,7 @@ loadData();
 
 <!-- ════ ORDER SEARCH MODAL ════ -->
 <div class="mo" id="searchMo">
-  <div class="md" style="width:700px">
+  <div class="md" style="width:820px">
     <button class="md-x" onclick="closeMo('searchMo')">&#x2715;</button>
     <h3 style="margin-bottom:14px">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:8px;color:var(--accent)"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
@@ -4328,11 +4448,11 @@ loadData();
     </h3>
     <div style="position:relative;margin-bottom:16px">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--text);pointer-events:none"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-      <input id="search-input" placeholder="Type order number, product name, or customer..." autocomplete="off"
+      <input id="search-input" placeholder="Order number, product name, customer..." autocomplete="off"
         oninput="runSearch(this.value)"
         style="padding-left:36px;font-size:13px;height:40px;border-color:var(--accent)">
     </div>
-    <div id="search-results" style="max-height:60vh;overflow-y:auto"></div>
+    <div id="search-results" style="max-height:70vh;overflow-y:auto"></div>
   </div>
 </div>
 
